@@ -22,6 +22,11 @@ pip install -e .
 rendergit https://github.com/karpathy/nanoGPT
 ```
 
+```bash
+rendergit https://<PAT for priv repos, else this portion won't be there>@github.com/roger-timble/timble_billing.git --skip staticfiles temp_resources
+```
+
+
 The code will:
 1. Clone the repo to a temporary directory
 2. Render its source code into a single static temporary HTML file
