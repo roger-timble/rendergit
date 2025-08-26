@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 Flatten a GitHub repo into a single static HTML page for fast skimming and Ctrl+F.
+
+Adds:
+  --skip <folder1> <folder2> ...  -> skip these folder NAMES anywhere in the tree (case-insensitive).
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import sys
 import tempfile
 import webbrowser
 from dataclasses import dataclass
-from typing import List
+from typing import List, Set
 
 # External deps
 from pygments import highlight
@@ -95,13 +98,29 @@ def looks_binary(path: pathlib.Path) -> bool:
         return True
 
 
-def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int) -> FileInfo:
+def _should_skip(rel: str, skip_names: Set[str]) -> bool:
+    """True if any path component of rel matches a name in skip_names (case-insensitive)."""
+    if not skip_names:
+        return False
+    lower = {s.lower() for s in skip_names}
+    for part in pathlib.PurePosixPath(rel).parts:
+        if part.lower() in lower:
+            return True
+    return False
+
+
+def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int, skip_names: Set[str]) -> FileInfo:
     rel = str(path.relative_to(repo_root)).replace(os.sep, "/")
     try:
         size = path.stat().st_size
     except FileNotFoundError:
         size = 0
-    # Ignore VCS and build junk
+
+    # Skip by folder name anywhere in the path
+    if _should_skip(rel, skip_names):
+        return FileInfo(path, rel, size, RenderDecision(False, "ignored"))
+
+    # Ignore VCS junk
     if "/.git/" in f"/{rel}/" or rel.startswith(".git/"):
         return FileInfo(path, rel, size, RenderDecision(False, "ignored"))
     if size > max_bytes:
@@ -111,23 +130,37 @@ def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int) -> 
     return FileInfo(path, rel, size, RenderDecision(True, "ok"))
 
 
-def collect_files(repo_root: pathlib.Path, max_bytes: int) -> List[FileInfo]:
+def collect_files(repo_root: pathlib.Path, max_bytes: int, skip_names: Set[str]) -> List[FileInfo]:
+    """
+    Walks the tree top-down so we can prune skipped directories early.
+    """
     infos: List[FileInfo] = []
-    for p in sorted(repo_root.rglob("*")):
-        if p.is_symlink():
-            continue
-        if p.is_file():
-            infos.append(decide_file(p, repo_root, max_bytes))
+    lower_skip = {s.lower() for s in skip_names} | {".git"}
+    for root, dirnames, filenames in os.walk(repo_root, topdown=True):
+        # Prune directories to skip (case-insensitive)
+        dirnames[:] = [d for d in dirnames if d.lower() not in lower_skip]
+        # Collect files
+        for fname in filenames:
+            p = pathlib.Path(root, fname)
+            if p.is_symlink():
+                continue
+            if p.is_file():
+                infos.append(decide_file(p, repo_root, max_bytes, skip_names))
+    # Sort by relative path for stable order
+    infos.sort(key=lambda fi: fi.rel.lower())
     return infos
 
 
-def generate_tree_fallback(root: pathlib.Path) -> str:
-    """Minimal tree-like output if `tree` command is missing."""
+def generate_tree_fallback(root: pathlib.Path, skip_names: Set[str]) -> str:
+    """Minimal tree-like output if `tree` command is missing, respecting skip_names."""
     lines: List[str] = []
-    prefix_stack: List[str] = []
+    lower_skip = {s.lower() for s in skip_names} | {".git"}
 
     def walk(dir_path: pathlib.Path, prefix: str = ""):
-        entries = [e for e in dir_path.iterdir() if e.name != ".git"]
+        try:
+            entries = [e for e in dir_path.iterdir() if e.name.lower() not in lower_skip]
+        except PermissionError:
+            return
         entries.sort(key=lambda e: (not e.is_dir(), e.name.lower()))
         for i, e in enumerate(entries):
             last = i == len(entries) - 1
@@ -142,12 +175,19 @@ def generate_tree_fallback(root: pathlib.Path) -> str:
     return "\n".join(lines)
 
 
-def try_tree_command(root: pathlib.Path) -> str:
+def try_tree_command(root: pathlib.Path, skip_names: Set[str]) -> str:
+    # Try to use `tree` with an ignore pattern; else fallback.
+    # Note: `tree -I` matches names (case-sensitive); fallback handles case-insensitive skipping.
+    ignore = ["*.git"] + list(skip_names)
+    pattern = "|".join(ignore) if ignore else ""
     try:
-        cp = run(["tree", "-a", "."], cwd=str(root))
+        if pattern:
+            cp = run(["tree", "-a", "-I", pattern, "."], cwd=str(root))
+        else:
+            cp = run(["tree", "-a", "."], cwd=str(root))
         return cp.stdout
     except Exception:
-        return generate_tree_fallback(root)
+        return generate_tree_fallback(root, skip_names)
 
 
 def read_text(path: pathlib.Path) -> str:
@@ -200,7 +240,7 @@ def generate_cxml_text(infos: List[FileInfo], repo_dir: pathlib.Path) -> str:
     return "\n".join(lines)
 
 
-def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: List[FileInfo]) -> str:
+def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: List[FileInfo], skip_names: Set[str]) -> str:
     formatter = HtmlFormatter(nowrap=False)
     pygments_css = formatter.get_style_defs('.highlight')
 
@@ -212,7 +252,7 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
     total_files = len(rendered) + len(skipped_binary) + len(skipped_large) + len(skipped_ignored)
 
     # Directory tree
-    tree_text = try_tree_command(repo_dir)
+    tree_text = try_tree_command(repo_dir, skip_names)
 
     # Generate CXML text for LLM view
     cxml_text = generate_cxml_text(infos, repo_dir)
@@ -266,7 +306,8 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
 
     skipped_html = (
         render_skip_list("Skipped binaries", skipped_binary) +
-        render_skip_list("Skipped large files", skipped_large)
+        render_skip_list("Skipped large files", skipped_large) +
+        render_skip_list("Skipped by ignore rules (.git or --skip)", skipped_ignored)
     )
 
     # HTML with left sidebar TOC
@@ -476,11 +517,19 @@ def main() -> int:
     ap.add_argument("-o", "--out", help="Output HTML file path (default: temporary file derived from repo name)")
     ap.add_argument("--max-bytes", type=int, default=MAX_DEFAULT_BYTES, help="Max file size to render (bytes); larger files are listed but skipped")
     ap.add_argument("--no-open", action="store_true", help="Don't open the HTML file in browser after generation")
+    ap.add_argument(
+        "--skip",
+        nargs="+",
+        default=[],
+        help="Folder NAMES to skip at any depth (case-insensitive), e.g. --skip node_modules dist build .venv"
+    )
     args = ap.parse_args()
 
     # Set default output path if not provided
     if args.out is None:
         args.out = str(derive_temp_output_path(args.repo_url))
+
+    skip_names: Set[str] = set(args.skip or [])
 
     tmpdir = tempfile.mkdtemp(prefix="flatten_repo_")
     repo_dir = pathlib.Path(tmpdir, "repo")
@@ -492,13 +541,13 @@ def main() -> int:
         print(f"✓ Clone complete (HEAD: {head[:8]})", file=sys.stderr)
 
         print(f"📊 Scanning files in {repo_dir}...", file=sys.stderr)
-        infos = collect_files(repo_dir, args.max_bytes)
+        infos = collect_files(repo_dir, args.max_bytes, skip_names)
         rendered_count = sum(1 for i in infos if i.decision.include)
         skipped_count = len(infos) - rendered_count
         print(f"✓ Found {len(infos)} files total ({rendered_count} will be rendered, {skipped_count} skipped)", file=sys.stderr)
 
         print(f"🔨 Generating HTML...", file=sys.stderr)
-        html_out = build_html(args.repo_url, repo_dir, head, infos)
+        html_out = build_html(args.repo_url, repo_dir, head, infos, skip_names)
 
         out_path = pathlib.Path(args.out)
         print(f"💾 Writing HTML file: {out_path.resolve()}", file=sys.stderr)
@@ -517,4 +566,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
